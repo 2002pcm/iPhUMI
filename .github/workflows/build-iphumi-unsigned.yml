@@ -1,15 +1,19 @@
-# iPhUMI no-Mac helper workflow v2
+# iPhUMI no-Mac helper workflow v3
 # Place this file at .github/workflows/build-iphumi-unsigned.yml in your fork.
 # Produces an UNSIGNED iPhone IPA for local re-signing with Sideloadly.
 # No Apple credentials, certificates or provisioning profiles are used in CI.
 # Prepared from upstream source inspection on 2026-09-15.
 # Builds the audited upstream commit, not arbitrary later edits in the fork.
-# This workflow has NOT been executed or device-tested by the author of this file.
+# v3 repairs the CocoaPods lockfile mismatch from run 34972411927.
+# Device signing and installation remain separate, local steps.
 # Baseline: an iPhone running iOS 26.0 or later, following upstream usage guidance.
 name: Build iPhUMI unsigned IPA
-run-name: iPhUMI unsigned - ${{ inputs.request_id }}
+run-name: iPhUMI unsigned - ${{ inputs.request_id || github.sha }}
 
 on:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/build-iphumi-unsigned.yml']
   workflow_dispatch:
     inputs:
       request_id:
@@ -23,6 +27,8 @@ permissions:
 
 jobs:
   build:
+    # Only explicitly marked repair commits auto-build; normal setup uses dispatch.
+    if: github.event_name != 'push' || contains(github.event.head_commit.message, '[iphumi-build]')
     runs-on: macos-26
     timeout-minutes: 40
     defaults:
@@ -57,16 +63,40 @@ jobs:
           if int(version.split(".")[0]) < 26:
               raise SystemExit("An iOS 26+ SDK is required for this workflow.")
           PY
-          if ! command -v pod >/dev/null 2>&1; then
-            brew install cocoapods
-          fi
-          pod --version | tee -a build/environment.log
+
+      - name: Select an isolated Ruby for CocoaPods
+        uses: ruby/setup-ruby@bec3f19a76460dbe12f60def7d1a77585f07516c # v1, inspected 2026-09-15
+        with:
+          ruby-version: '3.3.12'
+          bundler: '2.6.9'
+          bundler-cache: false
+
+      - name: Pin CocoaPods to the version recorded in Podfile.lock
+        run: |
+          set -euo pipefail
+          export BUNDLE_GEMFILE="$GITHUB_WORKSPACE/build/Gemfile"
+          echo "BUNDLE_GEMFILE=$BUNDLE_GEMFILE" >> "$GITHUB_ENV"
+          cat > "$BUNDLE_GEMFILE" <<'GEMFILE'
+          source 'https://rubygems.org'
+          gem 'cocoapods', '= 1.16.2'
+          gem 'xcodeproj', '= 1.27.0'
+          GEMFILE
+          bundle config set --local path "$RUNNER_TEMP/iphumi-bundle"
+          bundle install --jobs 4 --retry 3 2>&1 | tee build/bundle-install.log
+          test "$(bundle exec pod --version)" = '1.16.2'
+          {
+            ruby --version
+            bundle --version
+            bundle exec pod --version
+            cat "$BUNDLE_GEMFILE.lock"
+          } | tee -a build/environment.log
 
       - name: Install CocoaPods dependencies using the committed lockfile
         run: |
           set -euo pipefail
           cd ios_app
-          pod install --deployment 2>&1 | tee ../build/pod-install.log
+          bundle exec pod install --deployment 2>&1 | tee ../build/pod-install.log
+          git diff --exit-code -- Podfile.lock
 
       - name: Create a shared iPhUMI scheme for headless builds
         run: |
