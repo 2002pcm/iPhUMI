@@ -1,0 +1,208 @@
+# iPhUMI no-Mac helper workflow v2
+# Place this file at .github/workflows/build-iphumi-unsigned.yml in your fork.
+# Produces an UNSIGNED iPhone IPA for local re-signing with Sideloadly.
+# No Apple credentials, certificates or provisioning profiles are used in CI.
+# Prepared from upstream source inspection on 2026-09-15.
+# Builds the audited upstream commit, not arbitrary later edits in the fork.
+# This workflow has NOT been executed or device-tested by the author of this file.
+# Baseline: an iPhone running iOS 26.0 or later, following upstream usage guidance.
+name: Build iPhUMI unsigned IPA
+run-name: iPhUMI unsigned - ${{ inputs.request_id }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      request_id:
+        description: Identifier used to select this exact run and its artifact
+        required: false
+        default: manual
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-26
+    timeout-minutes: 40
+    defaults:
+      run:
+        shell: bash
+    env:
+      COCOAPODS_DISABLE_STATS: "true"
+
+    steps:
+      - name: Check out the inspected upstream source
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
+        with:
+          repository: real-stanford/iPhUMI
+          ref: 651001df6f1fffdf9960bf40182928c880cb8f3e
+          persist-credentials: false
+
+      - name: Record and check the build environment
+        run: |
+          set -euo pipefail
+          mkdir -p build
+          {
+            git rev-parse HEAD
+            sw_vers
+            xcodebuild -version
+            xcrun --sdk iphoneos --show-sdk-version
+          } | tee build/environment.log
+          python3 - <<'PY'
+          import subprocess
+          version = subprocess.check_output(
+              ["xcrun", "--sdk", "iphoneos", "--show-sdk-version"], text=True
+          ).strip()
+          if int(version.split(".")[0]) < 26:
+              raise SystemExit("An iOS 26+ SDK is required for this workflow.")
+          PY
+          if ! command -v pod >/dev/null 2>&1; then
+            brew install cocoapods
+          fi
+          pod --version | tee -a build/environment.log
+
+      - name: Install CocoaPods dependencies using the committed lockfile
+        run: |
+          set -euo pipefail
+          cd ios_app
+          pod install --deployment 2>&1 | tee ../build/pod-install.log
+
+      - name: Create a shared iPhUMI scheme for headless builds
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json
+          import subprocess
+          from pathlib import Path
+          import xml.etree.ElementTree as ET
+
+          project = Path("ios_app/iPhUMI.xcodeproj")
+          data = json.loads(subprocess.check_output(
+              ["plutil", "-convert", "json", "-o", "-", str(project / "project.pbxproj")],
+              text=True,
+          ))
+          targets = [
+              (identifier, obj) for identifier, obj in data["objects"].items()
+              if obj.get("isa") == "PBXNativeTarget" and obj.get("name") == "iPhUMI"
+          ]
+          if len(targets) != 1:
+              raise SystemExit(f"Expected one iPhUMI app target, found {len(targets)}")
+          identifier, target = targets[0]
+          product = data["objects"][target["productReference"]]["path"]
+          reference = {
+              "BuildableIdentifier": "primary",
+              "BlueprintIdentifier": identifier,
+              "BuildableName": product,
+              "BlueprintName": "iPhUMI",
+              "ReferencedContainer": "container:iPhUMI.xcodeproj",
+          }
+          scheme = ET.Element("Scheme", LastUpgradeVersion="2600", version="1.3")
+          build = ET.SubElement(scheme, "BuildAction", parallelizeBuildables="YES",
+                                buildImplicitDependencies="YES")
+          entries = ET.SubElement(build, "BuildActionEntries")
+          entry = ET.SubElement(entries, "BuildActionEntry", **{
+              "buildForTesting": "YES", "buildForRunning": "YES",
+              "buildForProfiling": "YES", "buildForArchiving": "YES",
+              "buildForAnalyzing": "YES",
+          })
+          ET.SubElement(entry, "BuildableReference", **reference)
+          ET.SubElement(scheme, "TestAction", buildConfiguration="Debug",
+                        shouldUseLaunchSchemeArgsEnv="YES")
+          for name, configuration in (("LaunchAction", "Debug"),
+                                      ("ProfileAction", "Release")):
+              action = ET.SubElement(scheme, name, buildConfiguration=configuration,
+                                     useCustomWorkingDirectory="NO")
+              runnable = ET.SubElement(action, "BuildableProductRunnable",
+                                       runnableDebuggingMode="0")
+              ET.SubElement(runnable, "BuildableReference", **reference)
+          ET.SubElement(scheme, "AnalyzeAction", buildConfiguration="Debug")
+          ET.SubElement(scheme, "ArchiveAction", buildConfiguration="Release",
+                        revealArchiveInOrganizer="YES")
+          directory = project / "xcshareddata" / "xcschemes"
+          directory.mkdir(parents=True, exist_ok=True)
+          ET.indent(scheme)
+          ET.ElementTree(scheme).write(directory / "iPhUMI.xcscheme",
+                                       encoding="utf-8", xml_declaration=True)
+          print(f"Created shared scheme for {identifier}: {product}")
+          PY
+          xcodebuild -list -workspace ios_app/iPhUMI.xcworkspace \
+            2>&1 | tee build/schemes.log
+
+      - name: Build an unsigned arm64 iPhone application
+        run: |
+          set -euo pipefail
+          xcodebuild \
+            -workspace ios_app/iPhUMI.xcworkspace \
+            -scheme iPhUMI \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/iphumi-derived" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            PROVISIONING_PROFILE_SPECIFIER="" \
+            IPHONEOS_DEPLOYMENT_TARGET=26.0 \
+            CURRENT_PROJECT_VERSION=1 \
+            ARCHS=arm64 \
+            ONLY_ACTIVE_ARCH=NO \
+            build 2>&1 | tee build/xcodebuild.log
+
+      - name: Package and inspect the unsigned IPA
+        run: |
+          set -euo pipefail
+          APP="$RUNNER_TEMP/iphumi-derived/Build/Products/Release-iphoneos/iPhUMI.app"
+          STAGE="$RUNNER_TEMP/iphumi-ipa-stage"
+          test -d "$APP"
+          test -x "$APP/iPhUMI"
+          mkdir -p "$STAGE/Payload"
+          ditto "$APP" "$STAGE/Payload/iPhUMI.app"
+          {
+            /usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$APP/Info.plist"
+            /usr/libexec/PlistBuddy -c 'Print :MinimumOSVersion' "$APP/Info.plist"
+            xcrun lipo -archs "$APP/iPhUMI"
+          } | tee build/package.log
+          (
+            cd "$STAGE"
+            zip -qry "$GITHUB_WORKSPACE/build/iPhUMI-unsigned.ipa" Payload
+          )
+          unzip -t build/iPhUMI-unsigned.ipa >> build/package.log
+          (
+            cd build
+            shasum -a 256 iPhUMI-unsigned.ipa > SHA256SUMS.txt
+          )
+          {
+            echo "source_repository=real-stanford/iPhUMI"
+            echo "source_commit=$(git rev-parse HEAD)"
+            echo "workflow_repository=$GITHUB_REPOSITORY"
+            echo "workflow_run_id=$GITHUB_RUN_ID"
+            echo "workflow_ref=$GITHUB_WORKFLOW_REF"
+            echo "minimum_ios=26.0"
+            echo "signing=unsigned; requires local signing before installation"
+            xcodebuild -version
+          } > build/build-metadata.txt
+          echo 'Unsigned IPA: sign locally with Sideloadly before installation.' \
+            >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: iPhUMI-unsigned-IPA
+          path: |
+            build/iPhUMI-unsigned.ipa
+            build/SHA256SUMS.txt
+            build/build-metadata.txt
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 7
+
+      - name: Upload diagnostic logs even when the build fails
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: iPhUMI-build-logs
+          path: build/*.log
+          if-no-files-found: ignore
+          retention-days: 7
