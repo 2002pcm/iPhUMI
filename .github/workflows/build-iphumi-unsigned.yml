@@ -6,7 +6,7 @@
 # Builds the audited upstream commit, not arbitrary later edits in the fork.
 # v3 repairs the CocoaPods lockfile mismatch from run 34972411927.
 # Device signing and installation remain separate, local steps.
-# Baseline: an iPhone running iOS 26.0 or later, following upstream usage guidance.
+# Baseline: an iPhone running iOS 18.0 or later, matching the upstream project deployment target.
 name: Build iPhUMI unsigned IPA
 run-name: iPhUMI unsigned - ${{ inputs.request_id || github.sha }}
 
@@ -174,7 +174,7 @@ jobs:
             CODE_SIGN_IDENTITY="" \
             DEVELOPMENT_TEAM="" \
             PROVISIONING_PROFILE_SPECIFIER="" \
-            IPHONEOS_DEPLOYMENT_TARGET=26.0 \
+            IPHONEOS_DEPLOYMENT_TARGET=18.0 \
             CURRENT_PROJECT_VERSION=1 \
             ARCHS=arm64 \
             ONLY_ACTIVE_ARCH=NO \
@@ -209,7 +209,7 @@ jobs:
             echo "workflow_repository=$GITHUB_REPOSITORY"
             echo "workflow_run_id=$GITHUB_RUN_ID"
             echo "workflow_ref=$GITHUB_WORKFLOW_REF"
-            echo "minimum_ios=26.0"
+            echo "minimum_ios=18.0"
             echo "signing=unsigned; requires local signing before installation"
             xcodebuild -version
           } > build/build-metadata.txt
@@ -237,4 +237,4 @@ jobs:
           if-no-files-found: ignore
           retention-days: 7
 
-# manual rebuild trigger 2026-10-07
+# iOS 18 rebuild trigger 2026-10-07
