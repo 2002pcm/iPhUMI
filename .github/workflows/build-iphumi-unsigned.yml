@@ -236,3 +236,5 @@ jobs:
           path: build/*.log
           if-no-files-found: ignore
           retention-days: 7
+
+# manual rebuild trigger 2026-10-07
